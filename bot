@@ -1,1 +1,461 @@
+"""
+bybit_bbu_ultra_bot_fixed.py
+Auto trader for Bybit USDT Perpetual (v5) с уведомлениями в Telegram
+"""
+
+import time
+import hmac
+import hashlib
+import requests
+import json
+import math
+import logging
+from typing import List, Dict, Optional
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone
+
+# -------------------------
+# CONFIG
+# -------------------------
+API_KEY = "YOUR_BYBIT_API_KEY"
+API_SECRET = "YOUR_BYBIT_API_SECRET"
+USE_TESTNET = True  # -> True: testnet, False: production
+
+# Trading settings
+LEVERAGE = 10
+RISK_PORTION = 0.5
+TP_PCT = 0.05
+SL_PCT = 0.05
+TIMEFRAME = "1h"
+
+# Indicator params
+BB_LEN = 9
+BB_MULT = 1
+VOL_LEN = 19
+VOL_MULT = 1.3
+RSI_LEN = 8
+MFI_LEN = 8
+MACD_FAST = 10
+MACD_SLOW = 21
+MACD_SIG = 7
+EMA200_LEN = 200
+STRUCT_LEN = 20
+
+SLEEP_BETWEEN_CYCLES = 60 * 10
+KLIMIT = 500
+MAX_API_ERRORS_BEFORE_BACKOFF = 5
+BACKOFF_SECONDS = 60
+
+SAFE_MODE = False
+active_symbols = set()
+
+# Bybit endpoints
+BASE_URL = "https://api-testnet.bybit.com" if USE_TESTNET else "https://api.bybit.com"
+
+# -------------------------
+# Logging
+# -------------------------
+LOGFILE = "bybit_bbu_ultra_bot.log"
+logging.basicConfig(
+    filename=LOGFILE,
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+console.setFormatter(formatter)
+logging.getLogger('').addHandler(console)
+
+# -------------------------
+# Telegram notifications
+# -------------------------
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+
+def send_telegram(message: str):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        logging.warning(f"Failed to send Telegram message: {e}")
+
+# -------------------------
+# Helpers: Bybit v5 signing
+# -------------------------
+RECV_WINDOW = "5000"
+
+def _now_ts_ms() -> str:
+    return str(int(time.time() * 1000))
+
+def sign_v5(api_key: str, api_secret: str, timestamp: str, recv_window: str, body_str: str) -> str:
+    prehash = timestamp + api_key + recv_window + body_str
+    signature = hmac.new(api_secret.encode('utf-8'), prehash.encode('utf-8'), hashlib.sha256).hexdigest()
+    return signature
+
+def auth_headers(body_str: str = "") -> Dict[str, str]:
+    ts = _now_ts_ms()
+    sign = sign_v5(API_KEY, API_SECRET, ts, RECV_WINDOW, body_str)
+    return {
+        "Content-Type": "application/json",
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+        "X-BAPI-SIGN": sign
+    }
+
+# -------------------------
+# Market and account helpers
+# -------------------------
+def safe_request_get(url: str, params: Dict = None, headers: Dict = None, timeout: int = 15) -> dict:
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logging.warning(f"GET {url} failed: {e}")
+        send_telegram(f"GET request failed: {e}")
+        raise
+
+def safe_request_post(url: str, body: Dict, headers: Dict = None, timeout: int = 15) -> dict:
+    body_str = json.dumps(body)
+    try:
+        r = requests.post(url, headers=headers or auth_headers(body_str), data=body_str, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logging.warning(f"POST {url} failed: {e} body={body}")
+        send_telegram(f"POST request failed: {e} body={body}")
+        raise
+
+def get_all_tickers(category: str = "linear") -> List[Dict]:
+    url = f"{BASE_URL}/v5/market/tickers"
+    params = {"category": category}
+    data = safe_request_get(url, params=params)
+    if data.get("retCode", 0) != 0:
+        raise RuntimeError(f"Error fetching tickers: {data}")
+    return data["result"]["list"]
+
+def top_n_gainers(n: int = 15) -> List[str]:
+    tickers = get_all_tickers("linear")
+    def pct(t):
+        try:
+            return float(t.get("prevPrice24h", 0))
+        except Exception:
+            return 0.0
+    sorted_t = sorted(tickers, key=lambda x: pct(x), reverse=True)
+    return [t["symbol"] for t in sorted_t[:n]]
+
+def get_klines(symbol: str, interval: str = "1h", limit: int = 200) -> pd.DataFrame:
+    url = f"{BASE_URL}/v5/market/kline"
+    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
+    data = safe_request_get(url, params=params)
+    if data.get("retCode", 0) != 0:
+        raise RuntimeError(f"Kline error for {symbol}: {data}")
+    rows = data["result"]["list"]
+    if not rows:
+        raise RuntimeError("Empty kline response")
+    mapped = []
+    for r in rows:
+        if isinstance(r, list):
+            mapped.append({"open": r[0], "high": r[1], "low": r[2], "close": r[3], "volume": r[4], "start": r[5]})
+        elif isinstance(r, dict):
+            mapped.append({"open": r.get("open"), "high": r.get("high"), "low": r.get("low"),
+                           "close": r.get("close"), "volume": r.get("volume"), "start": r.get("start")})
+    df = pd.DataFrame(mapped)
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["start"] = pd.to_datetime(df["start"], unit="ms")
+    df = df.set_index("start")
+    return df
+
+def get_usdt_balance() -> float:
+    url = f"{BASE_URL}/v5/account/wallet-balance"
+    body = {"coin": "USDT"}
+    body_str = json.dumps(body)
+    try:
+        headers = auth_headers(body_str)
+        data = safe_request_get(url, params=body, headers=headers)
+        if data.get("retCode", 0) == 0:
+            balances = data["result"].get("list", [])
+            for item in balances:
+                if item.get("coin") == "USDT":
+                    return float(item.get("walletBalance", 0) or 0)
+    except Exception:
+        logging.info("wallet-balance failed, trying /v5/account/balance")
+    url2 = f"{BASE_URL}/v5/account/balance"
+    try:
+        headers2 = auth_headers("{}")
+        resp2 = safe_request_get(url2, params={"coin": "USDT"}, headers=headers2)
+        if resp2.get("retCode", 0) == 0:
+            lst = resp2["result"].get("list", [])
+            for item in lst:
+                if item.get("coin") == "USDT":
+                    return float(item.get("availableBalance", 0) or 0)
+    except Exception as e:
+        logging.warning("Failed to fetch USDT balance: %s", e)
+    logging.warning("USDT balance not found or API responded unexpectedly.")
+    send_telegram("Warning: USDT balance not found or API issue")
+    return 0.0
+
+# -------------------------
+# Indicators
+# -------------------------
+def bbands(df: pd.DataFrame, length=BB_LEN, mult=BB_MULT):
+    basis = df["close"].rolling(length).mean()
+    dev = df["close"].rolling(length).std() * mult
+    upper = basis + dev
+    lower = basis - dev
+    return basis, upper, lower
+
+def sma(series: pd.Series, n: int):
+    return series.rolling(n).mean()
+
+def ema(series: pd.Series, n: int):
+    return series.ewm(span=n, adjust=False).mean()
+
+def rsi(series: pd.Series, n=RSI_LEN):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1 / n, adjust=False).mean()
+    ma_down = down.ewm(alpha=1 / n, adjust=False).mean()
+    rs = ma_up / (ma_down + 1e-9)
+    return 100 - (100 / (1 + rs))
+
+def mfi(df: pd.DataFrame, n=MFI_LEN):
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    raw_mf = tp * df["volume"]
+    pos = raw_mf.where(tp > tp.shift(1), 0.0)
+    neg = raw_mf.where(tp < tp.shift(1), 0.0)
+    sum_pos = pos.rolling(n).sum()
+    sum_neg = neg.rolling(n).sum()
+    mfi_series = 100 * (sum_pos / (sum_pos + sum_neg + 1e-9))
+    return mfi_series.fillna(50)
+
+def macd_hist(series: pd.Series, fast=MACD_FAST, slow=MACD_SLOW, sig=MACD_SIG):
+    fast_ema = ema(series, fast)
+    slow_ema = ema(series, slow)
+    macd_line = fast_ema - slow_ema
+    signal = ema(macd_line, sig)
+    hist = macd_line - signal
+    return macd_line, signal, hist
+
+# -------------------------
+# Signals
+# -------------------------
+def compute_signal(df: pd.DataFrame) -> Dict[str, bool]:
+    if len(df) < max(BB_LEN, VOL_LEN, MACD_SLOW, EMA200_LEN, STRUCT_LEN) + 5:
+        return {"long": False, "short": False}
+    basis, upper, lower = bbands(df, BB_LEN, BB_MULT)
+    vol_sma = sma(df["volume"], VOL_LEN)
+    vol_now = df["volume"] > vol_sma * VOL_MULT
+    vol_prev = df["volume"].shift(1) > vol_sma * VOL_MULT
+    vol_confirm = vol_now & vol_prev
+    rsi_s = rsi(df["close"], RSI_LEN)
+    mfi_s = mfi(df, MFI_LEN)
+    macd_line, macd_signal, macd_h = macd_hist(df["close"], MACD_FAST, MACD_SLOW, MACD_SIG)
+    mom_count = ((rsi_s > 40).astype(int) + (mfi_s > 40).astype(int) + (macd_h > 0).astype(int))
+    mom_confirm = mom_count >= 2
+    ema200 = ema(df["close"], EMA200_LEN)
+    prev_low = df["low"].rolling(STRUCT_LEN).min().shift(1)
+    prev_high = df["high"].rolling(STRUCT_LEN).max().shift(1)
+    struct_bull = df["low"] > prev_low
+    struct_bear = df["high"] < prev_high
+    was_below = df["close"].shift(1) < lower.shift(1)
+    back_inside_bull = (df["close"] > lower) & (df["close"] > df["open"])
+    bb_reversal_long = was_below & back_inside_bull
+    was_above = df["close"].shift(1) > upper.shift(1)
+    back_inside_bear = (df["close"] < upper) & (df["close"] < df["open"])
+    bb_reversal_short = was_above & back_inside_bear
+    basis_break_long = (df["close"].gt(basis)) & (df["close"].shift(1).le(basis.shift(1))) & mom_confirm & vol_now
+    basis_break_short = (df["close"].lt(basis)) & (df["close"].shift(1).ge(basis.shift(1))) & mom_confirm & vol_now
+    i = -2
+    htf_bull = df["close"].iloc[i] > ema200.iloc[i]
+    htf_bear = df["close"].iloc[i] < ema200.iloc[i]
+    long_signal = ((bb_reversal_long.iloc[i] & vol_confirm.iloc[i] & mom_confirm.iloc[i] & htf_bull & struct_bull.iloc[i]) |
+                   (basis_break_long.iloc[i] & htf_bull & struct_bull.iloc[i]))
+    short_signal = ((bb_reversal_short.iloc[i] & vol_confirm.iloc[i] & mom_confirm.iloc[i] & htf_bear & struct_bear.iloc[i]) |
+                    (basis_break_short.iloc[i] & htf_bear & struct_bear.iloc[i]))
+    return {"long": bool(long_signal), "short": bool(short_signal)}
+
+# -------------------------
+# Trading actions
+# -------------------------
+def set_leverage(symbol: str, leverage: int = LEVERAGE, category: str = "linear") -> dict:
+    url = f"{BASE_URL}/v5/position/set-leverage"
+    body = {"category": category, "symbol": symbol, "leverage": str(leverage)}
+    headers = auth_headers(json.dumps(body))
+    return safe_request_post(url, body, headers=headers)
+
+def place_market_order(symbol: str, side: str, qty: float, category: str = "linear") -> dict:
+    url = f"{BASE_URL}/v5/order/create"
+    body = {
+        "category": category, "symbol": symbol, "side": side,
+        "orderType": "Market", "qty": str(qty),
+        "timeInForce": "ImmediateOrCancel", "reduceOnly": False, "closeOnTrigger": False
+    }
+    logging.info("Placing order (simulated=%s): %s", SAFE_MODE, body)
+    send_telegram(f"Placing order {side} {symbol} qty={qty} (simulated={SAFE_MODE})")
+    if SAFE_MODE:
+        return {"retCode": 0, "retMsg": "OK (simulated)", "result": {"orderId": "simulated-12345"}}
+    headers = auth_headers(json.dumps(body))
+    return safe_request_post(url, body, headers=headers)
+
+def set_tp_sl(symbol: str, takeProfit: float = None, stopLoss: float = None, category: str = "linear") -> dict:
+    position_idx = 0
+    try:
+        pos = get_open_position(symbol)
+        if pos:
+            position_idx = pos.get("positionIdx", 0)
+    except Exception:
+        pass
+    url = f"{BASE_URL}/v5/position/trading-stop"
+    body = {"category": category, "symbol": symbol, "positionIdx": position_idx}
+    if takeProfit is not None: body["takeProfit"] = str(takeProfit)
+    if stopLoss is not None: body["stopLoss"] = str(stopLoss)
+    logging.info("Setting TP/SL (simulated=%s): %s", SAFE_MODE, body)
+    send_telegram(f"Setting TP/SL for {symbol} TP={takeProfit} SL={stopLoss} (simulated={SAFE_MODE})")
+    if SAFE_MODE:
+        return {"retCode": 0, "retMsg": "OK (simulated)", "result": {}}
+    headers = auth_headers(json.dumps(body))
+    return safe_request_post(url, body, headers=headers)
+
+def get_open_position(symbol: str) -> Optional[Dict]:
+    url = f"{BASE_URL}/v5/position/list"
+    params = {"category": "linear", "symbol": symbol}
+    try:
+        headers = auth_headers("{}")
+        data = safe_request_get(url, params=params, headers=headers)
+        if data.get("retCode", 0) == 0:
+            lst = data["result"].get("list", [])
+            for p in lst:
+                if float(p.get("size", 0)) > 0:
+                    return p
+    except Exception as e:
+        logging.warning("Failed to fetch positions: %s", e)
+        send_telegram(f"Failed to fetch positions: {e}")
+    return None
+
+# -------------------------
+# Order qty
+# -------------------------
+def compute_order_qty(usdt_balance: float, price: float, leverage: int = LEVERAGE, portion: float = RISK_PORTION) -> float:
+    notional = usdt_balance * portion * leverage
+    return notional / price if price > 0 else 0.0
+
+# -------------------------
+# Main loop
+# -------------------------
+def main_loop():
+    logging.info("Starting bot. TESTNET=%s SAFE_MODE=%s", USE_TESTNET, SAFE_MODE)
+    send_telegram(f"Bot started. TESTNET={USE_TESTNET} SAFE_MODE={SAFE_MODE}")
+    api_error_count = 0
+    while True:
+        try:
+            symbols = top_n_gainers(15)
+            logging.info("Top-15: %s", symbols)
+        except Exception as e:
+            logging.error("Error fetching top gainers: %s", e)
+            send_telegram(f"Error fetching top gainers: {e}")
+            api_error_count += 1
+            if api_error_count >= MAX_API_ERRORS_BEFORE_BACKOFF:
+                logging.warning("Too many API errors. Backing off %s seconds.", BACKOFF_SECONDS)
+                time.sleep(BACKOFF_SECONDS)
+                api_error_count = 0
+            else:
+                time.sleep(10)
+            continue
+
+        try:
+            usdt_balance = get_usdt_balance()
+            logging.info("USDT balance: %s", usdt_balance)
+        except Exception as e:
+            logging.error("Balance fetch error: %s", e)
+            send_telegram(f"Balance fetch error: {e}")
+            usdt_balance = 0.0
+
+        for sym in symbols:
+            try:
+                if sym in active_symbols:
+                    logging.info("Skipping %s because active position present.", sym)
+                    continue
+
+                df = get_klines(sym, interval=TIMEFRAME, limit=KLIMIT)
+                sig = compute_signal(df)
+                latest_price = float(df["close"].iloc[-2])
+                logging.info("%s price %s -> signal %s", sym, latest_price, sig)
+
+                if sig["long"] or sig["short"]:
+                    side = "Buy" if sig["long"] else "Sell"
+                    logging.info("Signal %s for %s at %s", side, sym, latest_price)
+                    send_telegram(f"Signal {side} for {sym} at {latest_price}")
+
+                    existing = get_open_position(sym)
+                    if existing:
+                        logging.info("Position already open for %s -> skipping entry.", sym)
+                        active_symbols.add(sym)
+                        continue
+
+                    try: set_leverage(sym, LEVERAGE)
+                    except Exception as e:
+                        logging.warning("Leverage set error for %s: %s", sym, e)
+
+                    qty = compute_order_qty(usdt_balance, latest_price, LEVERAGE, RISK_PORTION)
+
+                    try:
+                        info = get_symbol_info(sym)
+                        qty = round_qty_by_symbol(info, qty)
+                    except Exception:
+                        qty = math.floor(qty * 10000) / 10000.0
+
+                    if qty <= 0:
+                        logging.info("Computed qty <= 0 for %s, skip", sym)
+                        continue
+
+                    try:
+                        res = place_market_order(sym, side, qty)
+                        logging.info("Placed order response: %s", res)
+                        if res.get("retCode", 0) == 0:
+                            active_symbols.add(sym)
+                    except Exception as e:
+                        logging.error("Order placement error for %s: %s", sym, e)
+                        send_telegram(f"Order placement error for {sym}: {e}")
+                        continue
+
+                    if side == "Buy":
+                        tp_price = latest_price * (1 + TP_PCT)
+                        sl_price = latest_price * (1 - SL_PCT)
+                    else:
+                        tp_price = latest_price * (1 - TP_PCT)
+                        sl_price = latest_price * (1 + SL_PCT)
+
+                    try:
+                        set_tp_sl(sym, takeProfit=round(tp_price, 6), stopLoss=round(sl_price, 6))
+                        logging.info("Set TP %s and SL %s for %s", tp_price, sl_price, sym)
+                    except Exception as e:
+                        logging.warning("Failed to set TP/SL for %s: %s", sym, e)
+                        send_telegram(f"Failed to set TP/SL for {sym}: {e}")
+
+                time.sleep(0.5)
+            except Exception as e:
+                logging.exception("Error processing %s: %s", sym, e)
+                send_telegram(f"Error processing {sym}: {e}")
+                time.sleep(0.5)
+                continue
+
+        logging.info("Cycle complete. Sleeping %s seconds.", SLEEP_BETWEEN_CYCLES)
+        time.sleep(SLEEP_BETWEEN_CYCLES)
+
+if __name__ == "__main__":
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        logging.info("Bot stopped by user")
+        send_telegram("Bot stopped by user")
+    except Exception as e:
+        logging.exception("Fatal error: %s", e)
+        send_telegram(f"Fatal error: {e}")
 
