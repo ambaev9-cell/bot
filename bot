@@ -18,8 +18,8 @@ from datetime import datetime, timezone
 # -------------------------
 # CONFIG
 # -------------------------
-API_KEY = "YOUR_BYBIT_API_KEY"
-API_SECRET = "YOUR_BYBIT_API_SECRET"
+API_KEY = "4n1HrBYslBFpEBLCO3"
+API_SECRET = "a0OQKam1ESYSRFC6P8QZ9Kp89QbrKe0OhKCl"
 USE_TESTNET = True  # -> True: testnet, False: production
 
 # Trading settings
@@ -71,8 +71,8 @@ logging.getLogger('').addHandler(console)
 # -------------------------
 # Telegram notifications
 # -------------------------
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+TELEGRAM_BOT_TOKEN = "8561518080:AAEvf-gv_l7F-_jenwkLcO6LhXczcKHij70"
+TELEGRAM_CHAT_ID = "845312449"
 
 def send_telegram(message: str):
     try:
